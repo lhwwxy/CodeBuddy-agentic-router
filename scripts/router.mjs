@@ -9,7 +9,8 @@
 //   SessionEnd       兜底结算未闭合的回合
 //
 // 数据目录：${CODEBUDDY_PLUGIN_DATA}（插件更新保留）；决策/奖励全部本地 JSONL 落盘，可审计。
-// 核心算法 vendor 自 dsh-agentic-router（classify/strategies/meta/store，MIT）。
+// 核心算法 vendor 自 dsh-agentic-router（classify/strategies/meta/store，MIT），
+// 已同步其权重防爆地板 + ε 探索修复（见 agentic-router-gateway 仿真验证）。
 
 import { readFileSync, writeFileSync, appendFileSync, renameSync, statSync, mkdirSync, existsSync, readdirSync, rmSync } from 'node:fs'
 import { join } from 'node:path'
@@ -26,6 +27,12 @@ const CATALOG_TTL_MS = 24 * 3600 * 1000 // 模型目录：每天首次使用时�
 const MAX_REWARD_LINES = 1000          // 奖励/决策 JSONL 压实上限（会话启动时执行）
 const LIN_GRADUATION = 50
 const KNN_GRADUATION = 30
+// 档位级 ε 探索率：EXP3 按实现奖励评判专家，会惩罚付探索成本的 UCB；贪婪专家
+// 主导后没人再探索非首选档，正确档位的数据永远采不到。以 ε 概率随机推荐一个
+// 可用档位。AGENTIC_ROUTER_EXPLORATION=0 可关闭。
+const EXPLORATION_EPS = Number(process.env.AGENTIC_ROUTER_EXPLORATION) >= 0
+  ? Number(process.env.AGENTIC_ROUTER_EXPLORATION)
+  : 0.08
 
 // ---- 基础设施 ----
 
@@ -152,7 +159,7 @@ function onUserPromptSubmit(input) {
   const sid = input.session_id
   const text = typeof input.prompt === 'string' ? input.prompt : ''
   if (!sid || !text) return
-  catalog(input.cwd)
+  const cat = catalog(input.cwd)
 
   const cls = classify(text)
   const f = featuresOf(cls, text)
@@ -170,7 +177,15 @@ function onUserPromptSubmit(input) {
   }
   const meta = metaPick(recs, exp3)
   const chosenRec = meta.byName[meta.chosen] || recs.rule
-  const banditTier = chosenRec.tier || 'mid'
+  let banditTier = chosenRec.tier || 'mid'
+  // 档位级 ε 探索：以 ε 概率随机重掷一个可用档位（跳过无候选的“幽灵档”），
+  // 决策记录带 explored 标注；reward 照常记在最终推荐档上。
+  let explored = false
+  const available = Object.keys(cat.tiers || {}).filter((t) => (cat.tiers[t] || []).length > 0)
+  if (EXPLORATION_EPS > 0 && available.length > 1 && Math.random() < EXPLORATION_EPS) {
+    banditTier = available[Math.floor(Math.random() * available.length)]
+    explored = true
+  }
   // 护栏：bandit 冷启动探索可能对高复杂度任务推荐 fast（误导执行）。
   // 学习照常记录 banditTier，但注入给用户的建议档位设下限——高复杂度任务至少混合档。
   const tier = (cls.complexity >= 0.7 && banditTier === 'fast') ? 'mid' : banditTier
@@ -196,7 +211,7 @@ function onUserPromptSubmit(input) {
 
   store.appendJsonl('decisions.jsonl', {
     ts: Date.now(), sessionId: sid, turn: s.seq, taskType: cls.type,
-    complexity: cls.complexity, tier, banditTier, metaChosen: meta.chosen,
+    complexity: cls.complexity, tier, banditTier, explored: explored || undefined, metaChosen: meta.chosen,
     agent: input.agent_type || (process.env.CODEBUDDY_PLUGIN_ROOT ? 'cli' : 'settings-hook'),
     recs: {
       rule: recs.rule.tier, ucb: recs.ucb.tier, lin: recs.lin.tier, knn: String(recs.knn.tier),

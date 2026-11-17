@@ -3,6 +3,7 @@
 set -e
 cd "$(dirname "$0")/.."
 export AGENTIC_ROUTER_HOME="$(mktemp -d /tmp/cb-router-test-XXXX)"
+export AGENTIC_ROUTER_EXPLORATION=0 # 主流程用例需要确定性路由；探索行为单独在第 9 步验证
 SID="test-session-1"
 
 run() { echo "$1" | node scripts/router.mjs; }
@@ -20,7 +21,9 @@ if echo "$OUT" | grep -q "router-lite"; then echo "CLI 文案含子代理分发 
 if ! echo "$OUT" | grep -q "各步骤均分发 router-lite"; then echo "高复杂度护栏 ✓（未推荐全 lite）"; else echo "✗ 高复杂度任务不应全 lite"; exit 1; fi
 if [ -f "$AGENTIC_ROUTER_HOME/decisions.jsonl" ]; then echo "decisions.jsonl 落盘 ✓"; else echo "✗ decisions 缺失"; exit 1; fi
 OUT2=$(run "{\"hook_event_name\":\"UserPromptSubmit\",\"session_id\":\"ide-s1\",\"cwd\":\"$(pwd)\",\"agent_type\":\"ide\",\"prompt\":\"帮我重构这段代码并优化性能，需要仔细分析调用链路\"}")
-if echo "$OUT2" | grep -q "建议用户切换"; then echo "IDE 文案自适应 ✓"; else echo "✗ IDE 文案应为手动切模型建议"; exit 1; fi
+# metaPick 的 γ 混合带随机性（可能落在任一档），IDE 文案断言只看分支特征：
+# 三个档位的 IDE 文案都含"切换"（手动切模型建议），CLI 文案则没有
+if echo "$OUT2" | grep -q "切换"; then echo "IDE 文案自适应 ✓"; else echo "✗ IDE 文案应为手动切模型建议"; exit 1; fi
 run "{\"hook_event_name\":\"Stop\",\"session_id\":\"ide-s1\",\"stop_hook_active\":false}" > /dev/null
 
 echo "=== 3. UserPromptSubmit（极简闲聊 → 只记录不注入）==="
@@ -29,6 +32,7 @@ OUT=$(run "{\"hook_event_name\":\"UserPromptSubmit\",\"session_id\":\"$SID\",\"c
 
 echo "=== 4. PostToolUse（工具失败 ×2 → 计数）==="
 run "{\"hook_event_name\":\"PostToolUse\",\"session_id\":\"$SID\",\"tool_name\":\"Bash\",\"tool_input\":{},\"tool_response\":{\"ok\":false,\"error\":\"command not found\"}}" > /dev/null
+sleep 0.4 # 两次失败间隔需超过 300ms 去重窗口，否则被当成双注册的重复事件丢弃
 run "{\"hook_event_name\":\"PostToolUse\",\"session_id\":\"$SID\",\"tool_name\":\"Read\",\"tool_input\":{},\"tool_response\":{\"status\":\"error\"}}" > /dev/null
 python3 -c "
 import json,os
@@ -44,13 +48,14 @@ python3 -c "
 import json,os
 home=os.environ['AGENTIC_ROUTER_HOME']
 rewards=[json.loads(l) for l in open(home+'/rewards.jsonl') if l.strip()]
-# turn1（代码任务）被 test3 的 prompt 补结算 + turn2（你好，本回合 Stop）= 2 条
-assert len(rewards)==2, '应有 2 条奖励（含 1 条补结算），实际 %d' % len(rewards)
+# ide-s1 的 Stop（步骤2末）结算 1 条 + turn1（代码任务）被步骤3的 prompt 补结算
+# 1 条 + turn2（你好，本回合 Stop）1 条 = 3 条
+assert len(rewards)==3, '应有 3 条奖励（含 1 条补结算与 ide 会话 1 条），实际 %d' % len(rewards)
 r=rewards[-1]
 # 干净收尾 1 分 − 工具失败 0.2×2 = 0.6
 assert r['reward']==0.6, 'reward 应为 0.6，实际 %s' % r['reward']
 assert r['breakdown']['toolErrors']==2
-print('reward=0.6 ✓（本回合 toolErrors=2；另有补结算 1 条）')
+print('reward=0.6 ✓（本回合 toolErrors=2；含补结算与 ide 会话各 1 条）')
 "
 
 echo "=== 6. 再来一轮回合（飞轮重放生效：ucb.total 递增）==="
@@ -60,7 +65,7 @@ python3 -c "
 import json,os
 home=os.environ['AGENTIC_ROUTER_HOME']
 rewards=[json.loads(l) for l in open(home+'/rewards.jsonl') if l.strip()]
-assert len(rewards)==3, '应有 3 条奖励，实际 %d' % len(rewards)
+assert len(rewards)==4, '应有 4 条奖励，实际 %d' % len(rewards)
 t=json.load(open(home+'/turns/$SID.json'))
 assert t['open'] is None, '回合状态应已闭合'
 print('三回合奖励落盘 ✓，turns 状态闭合 ✓')
@@ -73,7 +78,7 @@ python3 -c "
 import json,os
 home=os.environ['AGENTIC_ROUTER_HOME']
 rewards=[json.loads(l) for l in open(home+'/rewards.jsonl') if l.strip()]
-assert len(rewards)==4, 'SessionEnd 应兜底结算，实际 %d 条' % len(rewards)
+assert len(rewards)==5, 'SessionEnd 应兜底结算，实际 %d 条' % len(rewards)
 print('SessionEnd 兜底结算 ✓（共 %d 条奖励）' % len(rewards))
 "
 
@@ -100,6 +105,29 @@ files=glob.glob(os.environ['AGENTIC_ROUTER_HOME']+'/turns/par-*.json')
 assert len(files)==0, 'SessionEnd 后会话文件应删除，剩余 %d' % len(files)
 print('SessionEnd 清理会话文件 ✓')
 "
+
+echo ""
+echo "=== 9. ε 探索（AGENTIC_ROUTER_EXPLORATION=1 必探索并标注 explored）==="
+# 探测源是 cwd/.codebuddy/settings.json：用带假配置的临时目录保证三档都有候选
+# 模型（本机真实配置可能探测不到任何模型，available 为空会跳过探索）
+EXP_HOME="$(mktemp -d /tmp/cb-router-exp-XXXX)"
+EXP_CWD="$(mktemp -d /tmp/cb-router-cwd-XXXX)"
+mkdir -p "$EXP_CWD/.codebuddy"
+cat > "$EXP_CWD/.codebuddy/settings.json" << 'JSON'
+{"model": "gpt-4o", "variantModels": {"fast": "deepseek-flash", "strong": "deepseek-v4-pro"}}
+JSON
+OUT=$(AGENTIC_ROUTER_HOME="$EXP_HOME" AGENTIC_ROUTER_EXPLORATION=1 run "{\"hook_event_name\":\"UserPromptSubmit\",\"session_id\":\"exp-1\",\"cwd\":\"$EXP_CWD\",\"prompt\":\"帮我总结这个项目的架构，并列出三个可以优化的点\"}")
+EXP_HOME="$EXP_HOME" python3 -c "
+import json,os
+home=os.environ['EXP_HOME']
+lines=[json.loads(l) for l in open(home+'/decisions.jsonl') if l.strip()]
+assert lines, 'explore 会话应有决策记录'
+d=lines[0]
+assert d.get('explored') is True, 'exploration=1 的决策必须标注 explored: %s' % d
+assert d['tier'] in ('fast','mid','strong'), '探索档位必须合法: %s' % d['tier']
+print('explored 标注 ✓（探索档位: %s，bandit 档: %s）' % (d['tier'], d['banditTier']))
+"
+rm -rf "$EXP_HOME" "$EXP_CWD"
 
 echo ""
 echo "✅ 全部冒烟测试通过。数据目录: $AGENTIC_ROUTER_HOME"
