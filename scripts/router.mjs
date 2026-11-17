@@ -158,7 +158,7 @@ function saveCatalog(c) { atomicWriteJson(catalogPath(), c) }
 function onUserPromptSubmit(input) {
   const sid = input.session_id
   const text = typeof input.prompt === 'string' ? input.prompt : ''
-  if (!sid || !text) return
+  if (!sid || !text || !text.trim()) return // 纯空白内容（如空输入）没有可分类信号
   const cat = catalog(input.cwd)
 
   const cls = classify(text)
